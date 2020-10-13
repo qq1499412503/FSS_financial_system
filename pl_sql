@@ -1,0 +1,666 @@
+create or replace PACKAGE BODY           Pkg_FSS_Settlement as
+
+PROCEDURE Print(p_module_name VARCHAR2, p_destination VARCHAR2 DEFAULT 'T') IS
+
+    mesg VARCHAR2(255) := 'In module '||p_module_name;
+  BEGIN
+    IF p_destination = 'T' THEN
+      common.log(mesg);
+    ELSE
+      DBMS_OUTPUT.put_line(mesg);
+    END IF;
+END Print;
+
+PROCEDURE fail(p_remarks IN VARCHAR2 DEFAULT 'failed') IS
+    run_log_id NUMBER;    
+    module_name  VARCHAR2(35) := 'statues_failed';
+  BEGIN
+    print(module_name||': '||p_remarks);
+    SELECT RUNID INTO run_log_id FROM FSS_RUN_TABLE
+     WHERE TRUNC(RUNSTART) = TRUNC(sysdate);
+     
+     UPDATE FSS_RUN_TABLE
+        SET RUNEND      = sysdate,
+            RUNOUTCOME  = 'FAILED',
+            REMARKS     = p_remarks
+      WHERE RUNID = run_log_id;
+    run_statue := FALSE;
+END fail;
+
+procedure upload_new_transaction is
+module_name  VARCHAR2(35)  :='upload_new_transaction';
+begin 
+print(module_name||'uploading');
+INSERT INTO FSS_DAILY_TRANSACTION(TRANSACTIONNR,
+                                    DOWNLOADDATE,
+                                    TERMINALID,
+                                    CARDID,
+                                    TRANSACTIONDATE,
+                                    CARDOLDVALUE,
+                                    TRANSACTIONAMOUNT,
+                                    CARDNEWVALUE,
+                                    TRANSACTIONSTATUS,
+                                    ERRORCODE)
+         SELECT FSS_TRANSACTIONS.TRANSACTIONNR,
+                FSS_TRANSACTIONS.DOWNLOADDATE,
+                FSS_TRANSACTIONS.TERMINALID,
+                FSS_TRANSACTIONS.CARDID,
+                FSS_TRANSACTIONS.TRANSACTIONDATE,
+                FSS_TRANSACTIONS.CARDOLDVALUE,
+                FSS_TRANSACTIONS.TRANSACTIONAMOUNT,
+                FSS_TRANSACTIONS.CARDNEWVALUE,
+                FSS_TRANSACTIONS.TRANSACTIONSTATUS,
+                FSS_TRANSACTIONS.ERRORCODE 
+           FROM FSS_TRANSACTIONS
+           WHERE NOT EXISTS (SELECT 1
+                      FROM FSS_DAILY_TRANSACTION                 
+                      WHERE FSS_TRANSACTIONS.transactionnr = FSS_DAILY_TRANSACTION .transactionnr);
+      COMMIT; 
+end upload_new_transaction;
+
+function get_settle_id return number is
+begin
+return settlements.NEXTVAL;
+end get_settle_id;
+
+
+PROCEDURE Check_run_table(p_runid    IN OUT NUMBER, p_run_data IN OUT FSS_RUN_TABLE%ROWTYPE) IS
+                            
+    module_name  VARCHAR2(35)  :='Check_run_table';
+    run_log_id     NUMBER;
+    moduleRan      EXCEPTION;
+BEGIN
+print(module_name||': '||'Checking run table for today');
+BEGIN
+SELECT * INTO p_run_data  FROM FSS_RUN_TABLE
+          WHERE RUNOUTCOME ='SUCCESS'
+          AND  TRUNC(RUNEND) = TRUNC(sysdate);
+          RAISE moduleRan;
+          
+EXCEPTION  WHEN NO_DATA_FOUND THEN
+p_runid := run.NEXTVAL;
+INSERT INTO FSS_RUN_TABLE(RUNID, RUNSTART, RUNEND, RUNOUTCOME, REMARKS)
+VALUES (p_runid, sysdate, NULL, NULL, 'Start Program'); 
+END;
+EXCEPTION WHEN moduleRan THEN
+    p_runid := -1;
+    print('Check the FSS_RUN_TABLE. Program ran at '|| p_run_data.RUNSTART);
+    WHEN OTHERS THEN      
+      fail(TO_CHAR('Error occured in '||module_name||' with '||SQLERRM));
+END Check_run_table; 
+
+PROCEDURE DailySettlement IS
+module_name  VARCHAR2(35) :='Daily_Settlement';
+run_msg      VARCHAR2(255);
+run_log_id     NUMBER;
+
+v_run_record FSS_RUN_TABLE%ROWTYPE;
+BEGIN
+print(module_name||'. Settling transactions for: '||to_char(sysdate, 'DD-MM-YYYY'));
+run_statue := TRUE;
+check_run_table(run_log_id, v_run_record);
+IF run_log_id = -1 THEN
+   run_msg := 'Program was ran at '||to_char(v_run_record.runstart);
+   run_msg := run_msg||' and end at ' ||to_char(v_run_record.runend);
+   print(run_msg); 
+ELSE
+    upload_new_Transaction;
+    settlement;
+    TerminalUsage;
+    --send_email;
+    send_email_with_attachment;
+END IF;
+
+IF run_statue THEN
+  UPDATE FSS_RUN_TABLE
+    SET RUNEND  =sysdate,
+        RUNOUTcome ='SUCCESS',
+        REMARKS = 'Running successful'
+ WHERE RUNID = run_log_id;
+  COMMIT;
+END IF;
+END DailySettlement;
+
+PROCEDURE upload_settleid(u_merchantid   IN NUMBER, 
+                              u_settleid IN VARCHAR2) IS  
+  module_name  VARCHAR2(35) := 'upload_settleid';
+  BEGIN
+    print(module_name||': Uploading settle_id '||u_settleid||' into FSS_DAILY_TRANSACTION for merchant '||u_merchantid);    
+    UPDATE FSS_DAILY_TRANSACTION trn 
+       SET trn.settleid = u_settleid
+     WHERE EXISTS (SELECT u_merchantid 
+                     FROM FSS_TERMINAL ter
+                    WHERE trn.TERMINALID=ter.TERMINALID
+                      AND ter.MERCHANTID=u_merchantid
+                      AND trn.settleid IS NULL); 
+end upload_settleid;
+
+PROCEDURE calc_transaction(p_debit IN NUMBER)  IS
+
+    module_name  VARCHAR2 (35) := 'calc_transaction';
+    v_settleid     VARCHAR2(15);
+    v_account_no   VARCHAR2(10);
+    v_mid           VARCHAR2(15) :='0';
+    v_mtitle        VARCHAR2 (32);
+    v_mbsb          VARCHAR2(6);
+    
+BEGIN
+     print(module_name||'. Calculating amount');   
+    v_settleid := get_settle_id;
+    
+    SELECT ORGACCOUNTTITLE,
+            ORGBSBNR,
+            ORGBANKACCOUNT
+    INTO  v_mtitle,v_mbsb, v_account_no
+    FROM  FSS_ORGANISATION
+    
+    WHERE  ROWNUM<2;
+        INSERT INTO FSS_DAILY_SETTLEMENT (SETTLEID,
+                                      RECORDTYPE, 
+                                      BSB, 
+                                      ACCOUNTNR,
+                                      TRAN_CODE,
+                                      SETTLEVALUE,
+                                      MERCHANTID,
+                                      MERCHANTTITLE, 
+                                      BANKFLAG, 
+                                      TRACE, 
+                                      REMITTER,
+                                      GSTTAX,
+                                      SETTLEDATE)                                        
+                              VALUES (v_settleid,
+                                      1,
+                                      v_mbsb,
+                                      v_account_no,
+                                      13,
+                                      p_debit,
+                                      v_mid,
+                                      v_mtitle, 
+                                      'N', 
+                                      '032-797 001006',
+                                      'SMARTCARD TRANS', 
+                                      '00000000', 
+                                      sysdate);
+  END calc_transaction;
+
+
+
+procedure settlement is
+module_name  VARCHAR2(35)  :='settlement';
+v_minimum_settle number;
+v_credit number :=0;
+v_Records number :=0;
+v_settle_id number;
+no_settlements  EXCEPTION;
+CURSOR merchant_totals is
+         SELECT m.MERCHANTBANKBSB bsb, 
+                m.MERCHANTBANKACCNR act,
+                SUBSTR(m.MERCHANTLASTNAME, 1, 32) Name, 
+                M.MERCHANTID merchantid,
+                SUM(t.TRANSACTIONAMOUNT) total
+           FROM fss_merchant m 
+           JOIN fss_terminal tl ON m.MERCHANTID = tl.MERCHANTID 
+           JOIN FSS_DAILY_TRANSACTION t ON tl.TERMINALID = t.TERMINALID   
+           GROUP BY m.MERCHANTLASTNAME, M.MERCHANTID, m.MERCHANTBANKBSB, m.MERCHANTBANKACCNR, SUBSTR(m.MERCHANTLASTNAME, 1, 32);
+merchant_total merchant_totals%ROWTYPE;
+begin
+print(module_name||': '||'setting records');
+SELECT TO_NUMBER(REPLACE(REFERENCEVALUE,'.')) INTO v_minimum_settle
+    FROM FSS_REFERENCE WHERE REFERENCEID='DMIN';
+ FOR merchant_total IN merchant_totals LOOP
+      IF merchant_total.total > v_minimum_settle THEN    
+        v_credit := v_credit + merchant_total.total;
+        v_Records := v_Records + 1;
+        v_settle_id := get_settle_id;
+
+        INSERT INTO FSS_DAILY_SETTLEMENT ( SETTLEID,
+                                          RECORDTYPE,
+                                          BSB,
+                                          ACCOUNTNR,
+                                          TRAN_CODE,
+                                          SETTLEVALUE,
+                                          MERCHANTID,
+                                          MERCHANTTITLE, 
+                                          BANKFLAG,
+                                          TRACE,
+                                          REMITTER,
+                                          GSTTAX,
+                                          SETTLEDATE)
+                                  VALUES ( v_settle_id,
+                                          1,
+                                          merchant_total.bsb,
+                                          merchant_total.act,
+                                          50, 
+                                          merchant_total.total,
+                                          merchant_total.merchantid,
+                                          merchant_total.Name, 
+                                          'F',
+                                          '032-797 001006', 
+                                          'SMARTCARD TRANS',
+                                          '00000000', 
+                                          sysdate);
+      upload_settleid(merchant_total.merchantid, v_settle_id);
+      END IF;
+      EXIT WHEN v_Records > 40;
+      END LOOP;
+    
+      IF v_Records > 0 THEN     
+       v_Records := v_Records + 1;
+       calc_transaction(v_credit);
+       COMMIT; 
+       deskbank;
+       DailyBankingSummary;    
+    ELSE
+       RAISE no_settlements;
+    END IF;  
+    EXCEPTION
+      WHEN no_settlements THEN
+        common.log('No unsettled transactions on '||to_char(sysdate));
+      WHEN OTHERS THEN
+        fail(TO_CHAR('Error occured in '||module_name||' with '||SQLERRM));
+
+end settlement;
+
+
+
+
+procedure deskbank(record_date IN DATE DEFAULT SYSDATE) is
+module_name  VARCHAR2(35)  :='create_deskbank';
+v_filename_deskbank varchar2(30) := '13019738_DS_'||to_char(sysdate, 'DDMMYYYY')||'.dat';
+--v_filename_deskbank varchar2(30) := 'testU130.dat';
+v_fileline varchar2(150);
+v_mtitle varchar(20);
+v_mbsb varchar(30);
+v_credit number :=0;
+v_debit number :=0;
+v_records number :=0;
+d_file utl_file.file_type;
+cursor settlements is
+select settleid, tran_code, accountnr, bsb, settlevalue, Merchantid, merchanttitle, trace, remitter, bankflag, settledate, gsttax from U13019738.FSS_DAILY_SETTLEMENT;
+begin
+print(module_name||': '||'creating deskbank');
+select orgbsbnr, orgaccounttitle into v_mtitle, v_mbsb from DBP_ADMIN.FSS_ORGANISATION;
+d_file := utl_file.fopen('U13019738_DIR', v_filename_deskbank, 'w');
+v_fileline := to_char(RPAD('0', 18) || 
+                          RPAD('01WBC', 12) ||  
+                          RPAD(LPAD(v_mbsb, 10),11) ||
+                          RPAD('PAYMENTS',15)||
+                          RPAD(v_mtitle, 6, ' ') ||
+                          RPAD('INVOICES', 12, ' ') ||
+                          to_char(sysdate, 'DDMMYY'));
+                          
+utl_file.put_line(d_file, v_fileline); 
+    FOR settlement IN settlements LOOP
+    v_Records := v_Records + 1;
+    if settlement.BANKFLAG = 'F' then
+        
+        v_fileline := TO_CHAR(1 ||
+                            RPAD(SUBSTR(settlement.bsb,1,3),3)||
+                            '-'|| 
+                            RPAD(SUBSTR(settlement.bsb,3,3),3)||
+                            LPAD(settlement.ACCOUNTNR,9,'0')|| 
+                            ' '||
+                            RPAD(settlement.TRAN_CODE, 2, '0')||
+                            LPAD(settlement.settlevalue,10,'0')||
+                            RPAD(UPPER(settlement.MERCHANTTITLE),32,' ')||
+                            ' '||settlement.BANKFLAG||' '||
+                            to_char(settlement.settledate,'YYYYMMDD')||
+                            LPAD(to_char(settlement.Merchantid),6)||
+                            to_char(settlement.settleid)||
+                            to_char(settlement.trace)||
+                            to_char(settlement.remitter)||' '||
+                            RPAD(settlement.gsttax,8));
+        ELSE
+            v_fileline := TO_CHAR(1 ||
+                            RPAD(SUBSTR(settlement.bsb,1,3),3)||
+                            '-'|| 
+                            RPAD(SUBSTR(settlement.bsb,3,3),3)||
+                            LPAD(settlement.ACCOUNTNR,9,'0')|| 
+                            ' '||
+                            RPAD(settlement.TRAN_CODE, 2, '0')||
+                            LPAD(settlement.settlevalue,10,'0')||
+                            RPAD(UPPER(settlement.MERCHANTTITLE),32,' ')||
+                            ' '||settlement.BANKFLAG||' '||
+                            to_char(settlement.settledate,'YYYYMMDD')||
+                            LPAD('000000',6)||
+                            to_char(settlement.settleid)||
+                            to_char(settlement.trace)||
+                            to_char(settlement.remitter)||' '||
+                            RPAD(settlement.gsttax,8));
+        end if;
+                            
+        IF settlement.TRAN_CODE = 50 THEN
+            v_credit := v_credit + settlement.settlevalue;
+        ELSE   
+            v_debit := v_debit + settlement.settlevalue;
+        END IF;
+       
+        utl_file.put_line(d_file, v_fileline);
+       
+        EXIT WHEN v_Records > 100;
+    END LOOP;
+v_fileline := TO_CHAR(RPAD('7999-999',20, ' ') ||
+                          RPAD(v_debit-v_credit,10,'0') ||
+                          LPAD(v_credit,10,'0') ||
+                          LPAD(v_debit,10,'0') ||
+                          LPAD(' ',24) ||
+                          LPAD(v_Records,6,'0'));
+utl_file.put_line(d_file, v_fileline);
+        
+utl_file.fclose(d_file);
+    
+
+end deskbank;
+
+
+FUNCTION format(p_currency IN NUMBER) RETURN VARCHAR2 IS
+BEGIN 
+RETURN TO_CHAR(SUBSTR(p_currency,0,length(p_currency)-2)||'.'|| SUBSTR(p_currency, -2, 2));
+END;
+
+PROCEDURE send_email(p_reportdate IN DATE DEFAULT sysdate)IS
+
+module_name  VARCHAR2(35)  :='send_mail';
+p_subject  VARCHAR2(50) := 'Summary report for'||to_char(p_reportdate, 'DD-MM-YYYY');
+p_message  VARCHAR2(120) := 'Attached is the summary report of '||to_char(p_reportdate, 'DD-MM-YYYY');
+p_recipient VARCHAR2(50) := '13019738@student.uts.edu.au';
+p_sender    VARCHAR2(50) := 'procedure@uts.edu.au';
+v_mailhost VARCHAR2(50) := 'postoffice.uts.edu.au';
+mail_conn       UTL_SMTP.connection;
+v_proc_name  VARCHAR2(50) := 'send_email';
+v_recipient_list  VARCHAR2(2000);
+v_recipient   VARCHAR2(80);
+v_counter     NUMBER := 0;
+con_nl VARCHAR2(2) := CHR(13)||CHR(10);
+con_email_footer VARCHAR2(250) := 'This is the email footer';
+--
+procedure log(p_message VARCHAR2) is
+BEGIN
+    DBMS_OUTPUT.PUT_LINE(p_message);
+END;
+--
+--
+BEGIN
+print(module_name||': sending mail to'||p_recipient);
+
+--     v_recipient_list := REPLACE(p_recipient, ' ');  --get rid of any spaces so that it's easier to split up
+         mail_conn := UTL_SMTP.open_connection (v_mailhost, 25);
+         UTL_SMTP.helo (mail_conn, v_mailhost);
+         UTL_SMTP.mail (mail_conn, p_sender);
+-- 
+-- The email list may contain multiple recipients. This little process will issue the UTL_SMTP.rcpt for each one of them
+--       LOOP
+--           v_counter := v_counter + 1;
+--           v_recipient := get_item_from_list(v_recipient_list);
+--           log(v_proc_name, 'recipient is '||v_recipient||'  list ='||v_recipient_list||'  count= '||v_counter);
+--           exit when v_recipient = 'EMPTY';
+--           UTL_SMTP.rcpt (mail_conn, p_recipient);
+--           EXIT when v_counter > 100; --This is here for testing and just in case the loop "runs away"  - Leave it in
+ --      END LOOP;
+ --
+         UTL_SMTP.rcpt (mail_conn, p_recipient);
+         UTL_SMTP.open_data (mail_conn);
+         UTL_SMTP.write_data (mail_conn,'From' || ':' || p_sender|| con_nl);
+         UTL_SMTP.write_data (mail_conn,'To'|| ':'|| p_recipient|| con_nl);
+         UTL_SMTP.write_data (mail_conn,'Subject'|| ':'|| p_subject||con_nl);
+         UTL_SMTP.write_data (mail_conn, con_nl || p_message||con_nl);
+         UTL_SMTP.write_data (mail_conn, con_nl || con_email_footer||con_nl);
+         UTL_SMTP.close_data (mail_conn);
+         UTL_SMTP.quit (mail_conn);
+         log('Email sent, check your inbox');
+EXCEPTION
+   WHEN OTHERS THEN
+      log('Error occured in send_email with '||con_nl||SQLERRM);
+      UTL_SMTP.close_data (mail_conn);
+END send_email;
+
+
+
+PROCEDURE DailyBankingSummary(p_report_date IN DATE DEFAULT SYSDATE) IS
+    module_name       VARCHAR2(19) := 'DailyBankingSummary';
+    v_filename          VARCHAR2(38) := '13019738_DB_'||to_char(sysdate, 'DDMMYYYY')||'.txt';
+    v_filename_deskbank VARCHAR2(30) := '13019738_DS_'||to_char(p_report_date,'DDMMYYYY')||'.dat';
+    v_fileline          VARCHAR2(120);  
+    v_currency          VARCHAR2(12);
+    v_total_credit      NUMBER :=0;
+    v_total_debit       NUMBER :=0;
+    v_counter           NUMBER :=0;
+    v_file utl_file.file_type;
+    CURSOR settlement IS
+        SELECT MERCHANTID, MERCHANTTITLE, ACCOUNTNR,
+               SETTLEVALUE, TRAn_CODE
+        FROM FSS_DAILY_SETTLEMENT
+        WHERE TRUNC (SETTLEDATE) = TRUNC(P_REPORT_DATE)
+        AND settleid IS NOT NULL;
+        
+        settle_record settlement%ROWTYPE;  
+        
+    BEGIN
+    print(module_name||'. Generating daily banking summary for: '||to_char(p_report_date, 'DD-Mon-YYYY'));
+    
+    v_file := utl_file.fopen ('U13019738_DIR',v_filename, 'W');
+    
+    v_fileline := LPAD(' ', 30, ' ') || 'SMARTCARD SETTLEMENT SYSTEM';
+    utl_file.put_line(v_file, v_fileline);    
+    v_fileline := LPAD(' ', 32, ' ') || 'DAILY DESKBANK SUMMARY';
+    utl_file.put_line(v_file, v_fileline);
+    
+    
+    v_fileline := TO_CHAR('Date '||
+                          TO_CHAR(sysdate,'DD-MM-YYYY')) ||
+                          LPAD('Page 1', 76, ' ');                            
+    utl_file.put_line(v_file, v_fileline);
+    
+    utl_file.put_line(v_file, '');    
+    v_fileline := RPAD('Merchant ID', 12, ' ')    ||
+                  RPAD('Merchant Name', 33, ' ')  ||
+                  RPAD('Account Number', 15, ' ') ||
+                  LPAD('Debit', 15, ' ')          ||
+                  LPAD('Credit', 16, ' ');
+    utl_file.put_line(v_file, v_fileline);   
+    
+    v_fileline := RPAD('-', 11, '-')||' '||
+                  RPAD('-', 32, '-')||' '||
+                  RPAD('-', 14, '-')||' '||
+                  RPAD('-', 15, '-')||' '||
+                  RPAD('-', 15, '-');    
+    utl_file.put_line(v_file, v_fileline);
+    
+       
+    FOR settle_record IN settlement LOOP
+      v_fileline := RPAD(NVL(to_char(settle_record.merchantid),' '), 12, ' ')||
+                    RPAD(settle_record.MERCHANTTITLE, 33, ' ') ||
+                    RPAD(settle_record.ACCOUNTNR, 15, ' ');
+      v_currency := format(settle_record.SETTLEVALUE);
+
+     
+      IF settle_record.TRAN_CODE = 13 THEN
+        v_total_debit := v_total_debit + settle_record.SETTLEVALUE;
+        v_fileline := v_fileline || LPAD(v_currency, 15, ' ');
+      ELSE
+        v_total_credit := v_total_credit + settle_record.SETTLEVALUE;
+        v_fileline := v_fileline ||
+                      LPAD(' ', 15, ' ') ||
+                      LPAD(v_currency, 16, ' ');
+      END IF;
+      utl_file.put_line(v_file, v_fileline);
+      
+      v_counter := v_counter + 1;
+      EXIT WHEN v_counter > 50;
+    END LOOP;
+    
+    v_fileline := RPAD(' ', 60, ' ')||
+                  RPAD('-', 15, '-')||' '||
+                  RPAD('-', 15, '-'); 
+    utl_file.put_line(v_file, v_fileline);  
+
+    
+    v_currency := format(v_total_debit);
+    v_fileline := RPAD('BALANCE TOTAL', 60, ' ')||
+                  LPAD(v_currency, 15, ' ')||' ';   
+
+    v_currency := format(v_total_credit);
+    v_fileline := v_fileline||LPAD(v_currency, 15, ' ');
+    utl_file.put_line(v_file, v_fileline);
+    
+    v_fileline := 'Deskbank file Name : '|| v_filename_deskbank;
+    utl_file.put_line(v_file, v_fileline);
+    
+    v_fileline := 'Dispatch Date'||LPAD(': ',8,' ')|| to_char(p_report_date, 'DD MM YYYY');
+    utl_file.put_line(v_file, v_fileline);
+  
+  
+    utl_file.put_line(v_file, '');
+    v_fileline := LPAD(' ', 30, ' ') ||'****** End of Report ******';
+    utl_file.put_line(v_file, v_fileline);
+    
+    utl_file.fclose(v_file);   
+    
+    
+END DailyBankingSummary;
+  
+PROCEDURE TerminalUsage is
+module_name  VARCHAR2(35)  :='TerminalUsageReport';
+v_filePointer utl_file.file_type; 
+v_utlfilename VARCHAR2(35) := '13019738_'||'TUREP_'||to_char(sysdate,'DDMMYYYY')||'.rpt';
+v_utlDir VARCHAR2(35) := 'U13019738_DIR';
+v_total VARCHAR2(30);
+cursor turs is
+    select 
+    fss_terminal.terminalid,
+    fss_terminal.terminaltype,
+    fss_terminal_type.typedescription,
+    fss_merchant.merchantfirstname,
+    fss_merchant.merchantlastname,
+    count(fss_daily_transaction.transactionnr) as tr_count,
+    sum(fss_daily_transaction.transactionamount) as tr_sum
+   
+    from fss_merchant join fss_terminal on fss_merchant.merchantid = fss_terminal.merchantid 
+    join fss_terminal_type on fss_terminal_type.typename = fss_terminal.terminaltype
+    join fss_daily_transaction on fss_terminal.terminalid = fss_daily_transaction.terminalid 
+    join fss_daily_settlement on fss_daily_transaction.settleid = fss_daily_settlement.settleid 
+    where fss_daily_settlement.settledate between trunc(sysdate, 'MM') and trunc(sysdate)
+       group by fss_terminal.terminalid, fss_terminal.terminaltype, fss_terminal_type.typedescription,fss_merchant.merchantfirstname,fss_merchant.merchantlastname 
+       ORDER BY sum(fss_daily_transaction.transactionamount) DESC;
+       
+       tur turs%ROWTYPE; 
+begin
+print(module_name||': Generating terminal usage report');
+v_filePointer := utl_file.fopen(v_utlDir, v_utlFileName, 'W'); 
+      
+       utl_file.put_line(v_filePointer, LPAD(' ', 60, ' ') || 'SMARTCARD SETTLEMENT SYSTEM');                 
+       utl_file.put_line(v_filePointer ,LPAD(' ', 63, ' ') || 'TERMINAL USAGE REPORT');
+       utl_file.put_line(v_filePointer , 'Report Date '||to_char(sysdate,'DD-MM-YYYY') || LPAD('Page X', 110, ' '));
+       utl_file.new_line(v_filePointer);
+       utl_file.put_line(v_filePointer ,'Usage Month '||to_char(sysdate,'MM-YYYY'));
+       utl_file.new_line(v_filePointer);
+       utl_file.new_line(v_filePointer);
+       
+       utl_file.put_line(v_filePointer ,RPAD('TerminalID', 18, ' ') || RPAD('Terminal', 10, ' ') || 
+                                        RPAD('TerminalType', 40, ' ') || RPAD('Merchant ', 20, ' ')||
+                                        LPAD('Number of ', 20, ' ')|| LPAD('TotalTransaction ', 25, ' '));
+                                        
+       utl_file.put_line(v_filePointer ,RPAD(' ', 20, ' ') || RPAD('Type', 9, ' ') || 
+                                        RPAD('Description', 41, ' ') || RPAD('Name ', 18, ' ')||
+                                        LPAD('Transactions', 20, ' ')|| LPAD('Amount ', 20, ' '));
+       utl_file.put_line(v_filePointer ,RPAD('-', 10, '-')||' '|| RPAD(' ', 6, ' ') ||' '|| RPAD('-', 8, '-')||' '||' '|| RPAD('-', 25, '-')||' '||
+                                        RPAD(' ', 1, ' ') ||' '||RPAD('-', 36, '-')||' '|| RPAD(' ', 1, ' ') ||' '|| RPAD('-', 15, '-')||' '|| RPAD(' ', 2, ' ') ||' '|| RPAD('-', 18, '-')); 
+                          open turs;
+                          LOOP
+                          FETCH turs into tur;
+                          EXIT WHEN turs%NOTFOUND;
+                         v_total := SUBSTR(tur.tr_sum,0,length(tur.tr_sum)-2) ||'.'||SUBSTR(tur.tr_sum, -2, 2);
+   
+       utl_file.put_line(v_filePointer ,RPAD(tur.terminalid, 21, ' ') || RPAD(tur.terminaltype, 7, ' ') || 
+                                        RPAD(tur.typedescription, 28, ' ') || RPAD(tur.merchantfirstname, 45, ' ')||
+                                        RPAD(tur.typedescription, 28, ' ') || RPAD(tur.merchantlastname, 45, ' ')||
+                                        RPAD(tur.tr_count, 18, ' ')||'$'||to_char(v_total));
+  
+                          end loop;
+                          utl_file.new_line(v_filePointer);
+                          utl_file.put_line(v_filePointer, LPAD(' ', 60, ' ') ||'****  End of Report  ****');      
+                                        utl_file.fclose(v_filePointer);
+end TerminalUsage;
+
+procedure send_email_with_attachment(p_reportdate IN DATE DEFAULT sysdate) is                                     
+  con_email_server VARCHAR2(50) := 'postoffice.uts.edu.au';
+  con_nl VARCHAR2(2) := CHR(13)||CHR(10);
+  con_email_footer VARCHAR2(250) := 'This is the email footer';
+--  
+  v_connection UTL_SMTP.CONNECTION;
+  v_filename          VARCHAR2(38) := '13019738_DB_'||to_char(sysdate, 'DDMMYYYY')||'.txt';
+  v_counter     NUMBER := 0;
+  v_recipient_list  VARCHAR2(2000);
+  v_recipient   VARCHAR2(80);
+  v_proc_name  VARCHAR2(50) := 'send_email_with_attachment';
+  v_boundary_text VARCHAR2(25) := 'Bobby Boundary';
+  v_loc     VARCHAR2(255);
+  p_subject  VARCHAR2(50) := 'Summary report for'||to_char(p_reportdate, 'DD-MM-YYYY');
+  p_message  VARCHAR2(120) := 'Attached is the banking summary report of '||to_char(p_reportdate, 'DD-MM-YYYY');
+  p_recipiant VARCHAR2(50) := '13019738@student.uts.edu.au';
+  p_sender    VARCHAR2(50) := 'procedure@uts.edu.au';
+  --
+  P_data varchar2(30000);
+  v_file utl_file.file_type;
+  v_data varchar2(30000);
+  i number;
+  cursor c_runs is select * from U13019738.fss_run_table;
+  
+BEGIN
+  v_file := utl_file.fopen ('U13019738_DIR',v_filename, 'R');
+
+  
+  v_recipient_list := REPLACE(p_recipiant, ' ');  --get rid of any spaces so that it's easier to split up
+  v_connection := UTL_SMTP.OPEN_CONNECTION(con_email_server, 25);
+  UTL_SMTP.HELO(v_connection,con_email_server);
+  UTL_SMTP.MAIL(v_connection, p_recipiant);
+  UTL_SMTP.rcpt (v_connection, p_recipiant);
+  v_loc := 'Position 1';    
+  UTL_SMTP.OPEN_DATA(v_connection);
+  UTL_SMTP.WRITE_DATA(v_connection,'From' || ':' || p_sender|| con_nl);
+  UTL_SMTP.WRITE_DATA(v_connection, 'To: '||p_recipiant||con_nl);
+  UTL_SMTP.WRITE_DATA(v_connection, 'Subject: '||p_subject||con_nl);
+  UTL_SMTP.WRITE_DATA(v_connection,'Mime-Version: 1.0'||con_nl);
+  UTL_SMTP.WRITE_DATA(v_connection,'Content-Type: multipart/mixed; boundary="'||v_boundary_text||'"'||con_nl||con_nl);
+  UTL_SMTP.WRITE_DATA(v_connection,'--'||v_boundary_text||con_nl);
+  UTL_SMTP.WRITE_DATA(v_connection,'Content-type: text/plain; charset=us-ascii'||con_nl);
+  UTL_SMTP.WRITE_DATA(v_connection,con_nl||p_message||con_nl);
+  UTL_SMTP.WRITE_DATA(v_connection,con_nl||'Sent From the Database Programming Database by the PL/SQL application '||con_nl);
+  UTL_SMTP.WRITE_DATA(v_connection,'The report data for the FSS settlement report is in the attached file'||con_nl||con_nl);
+  UTL_SMTP.WRITE_DATA(v_connection, 'Regards'||con_nl||'The DP Database'||con_nl||con_nl);
+  UTL_SMTP.write_data (v_connection, con_nl || con_email_footer||con_nl||con_nl);
+--
+  v_loc := 'Position 2';
+  UTL_SMTP.WRITE_DATA(v_connection,con_nl||'--'||v_boundary_text||con_nl);
+  UTL_SMTP.WRITE_DATA(v_connection,'Content-Type: application/octet-stream; name="'||'run_records.csv'||'"'||con_nl);
+  UTL_SMTP.WRITE_DATA(v_connection,'Content-Transfer-Encoding: 7bit'||con_nl||con_nl);    --7bit
+  for c_run in c_runs loop
+  p_data := to_char(c_run.runid)||','||to_char(c_run.runstart)||','||to_char(c_run.runend)||','||to_char(c_run.runoutcome)||','||to_char(c_run.remarks);
+  UTL_SMTP.WRITE_DATA(v_connection,p_data||con_nl);
+  end loop;
+ 
+ --
+  v_loc := 'Position 3';
+  UTL_SMTP.WRITE_DATA(v_connection,con_nl||'--'||v_boundary_text||con_nl);
+  UTL_SMTP.WRITE_DATA(v_connection,'Content-Type: application/octet-stream; name="'||'banking_summary.txt'||'"'||con_nl);
+  UTL_SMTP.WRITE_DATA(v_connection,'Content-Transfer-Encoding: 7bit'||con_nl||con_nl);    --7bit
+  loop
+  UTL_FILE.GET_LINE(v_file,v_data);
+  UTL_SMTP.WRITE_DATA(v_connection,v_data||con_nl);
+  i := i + 1;
+  exit when i >50;
+  end loop;
+  UTL_FILE.FCLOSE(v_file);
+--
+ v_loc := 'Position 4';
+  UTL_SMTP.WRITE_DATA(v_connection,con_nl||'--'||v_boundary_text||'--'||con_nl);
+  UTL_SMTP.CLOSE_DATA(v_connection);
+  UTL_SMTP.QUIT(v_connection);
+EXCEPTION
+   WHEN OTHERS THEN
+     Common.Log(v_proc_name, 'At '||v_loc||'    Error occured with '||SQLERRM);  
+     UTL_SMTP.CLOSE_DATA(v_connection);
+END send_email_with_attachment;
+
+end Pkg_FSS_Settlement;
+
